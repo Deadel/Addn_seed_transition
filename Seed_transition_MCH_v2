@@ -1,0 +1,180 @@
+import os
+import math
+import random
+from dataclasses import dataclass
+from typing import List, Tuple
+
+import numpy as np
+import torch
+from PIL import Image
+from torchvision import transforms
+import gradio as gr
+import imageio
+
+from modules import scripts, processing
+from modules.shared import state
+from modules.images import resize_image
+
+
+d @dataclass
+class BlendConfig:
+    seed_list: List[int]
+    steps_per_pair: int
+    curve_type: str
+    curve_intensity: float
+    img_width: int
+    img_height: int
+    apply_upscale: bool
+    upscaler: str
+    scale_factor: float
+    preview_enabled: bool
+    video_enabled: bool
+    fps: int
+    output_dir: str
+
+
+def calculate_blend_value(index: int, total: int, mode: str, intensity: float) -> float:
+    ratio = index / total
+    if mode == "linear":
+        return ratio
+    elif mode == "ease-in":
+        return ratio ** intensity
+    elif mode == "ease-out":
+        return 1 - (1 - ratio) ** intensity
+    elif mode == "wave":
+        return ratio + math.sin(ratio * math.pi * 2) * (intensity / 10)
+    return ratio
+
+
+def build_blend_sequence(seeds: List[int], steps: int, curve: str, strength: float) -> List[Tuple[int, int, float]]:
+    sequence = []
+    for i in range(len(seeds) - 1):
+        start, end = seeds[i], seeds[i + 1]
+        for step in range(steps):
+            blend = calculate_blend_value(step, steps, curve, strength)
+            sequence.append((start, end, blend))
+    sequence.append((seeds[-1], seeds[-1], 0.0))  # hold on last
+    return sequence
+
+
+class SeedBlendScript(scripts.Script):
+    def title(self):
+        return "Seed Travel MCH - Blend Generator"
+
+    def show(self, is_img2img):
+        return True
+
+    def ui(self, is_img2img):
+        with gr.Column():
+            seed_textbox = gr.Textbox(
+                label="Seeds (comma-separated)",
+                value="42,1337,9001"
+            )
+            step_slider = gr.Slider(
+                label="Interpolation steps", minimum=1, maximum=60,
+                value=30, step=1
+            )
+            curve_mode = gr.Dropdown(
+                label="Curve type",
+                choices=["linear", "ease-in", "ease-out", "wave"],
+                value="linear"
+            )
+            curve_power = gr.Slider(
+                label="Curve strength", minimum=0.1,
+                maximum=5.0, value=1.0, step=0.1
+            )
+            mode_select = gr.Radio(
+                label="Blend mode",
+                choices=["Seed Morph", "Subseed Morph"],
+                value="Seed Morph"
+            )
+            enable_upscale = gr.Checkbox(
+                label="Enable upscaling", value=False
+            )
+            upscale_method = gr.Dropdown(
+                label="Upscaler method",
+                choices=["Lanczos", "ESRGAN", "None"],
+                value="Lanczos"
+            )
+            upscale_scale = gr.Slider(
+                label="Upscale factor", minimum=1.0,
+                maximum=4.0, value=1.0, step=0.1
+            )
+            framerate = gr.Slider(
+                label="FPS (0 = disable video)",
+                minimum=0, maximum=60, value=30, step=1
+            )
+            show_preview = gr.Checkbox(
+                label="Display in WebUI", value=True
+            )
+        return [
+            seed_textbox, step_slider, curve_mode,
+            curve_power, mode_select, enable_upscale,
+            upscale_method, upscale_scale, framerate, show_preview
+        ]
+
+    def run(
+        self, p,
+        seed_textbox, step_slider, curve_mode,
+        curve_power, mode_select,
+        enable_upscale, upscale_method,
+        upscale_scale, framerate, show_preview
+    ):
+        output_root = os.path.join(p.outpath_samples, "seed_travel_mch")
+        os.makedirs(output_root, exist_ok=True)
+
+        seeds = [int(s.strip()) for s in seed_textbox.split(",") if s.strip().isdigit()]
+        gallery = []
+        cache = {}
+
+        # Subseed morph only uses first seed
+        if mode_select == "Subseed Morph":
+            base_seed = seeds[0] if seeds else random.randint(0, 2**32 - 1)
+            p.seed = base_seed
+            p.n_iter = 1
+            p.batch_size = 1
+            for i in range(step_slider + 1):
+                p.subseed = base_seed
+                p.subseed_strength = i / step_slider
+                proc = processing.process_images(p)
+                img = proc.images[0]
+                if enable_upscale and upscale_scale != 1.0 and upscale_method != "None":
+                    new_w = int(p.width * upscale_scale)
+                    new_h = int(p.height * upscale_scale)
+                    img = resize_image(0, img, new_w, new_h, upscaler_name=upscale_method)
+                gallery.append(img)
+                if state.interrupted:
+                    break
+        else:
+            sequence = build_blend_sequence(seeds, step_slider, curve_mode, curve_power)
+            p.n_iter = 1
+            p.batch_size = 1
+            for origin_seed, target_seed, blend_strength in sequence:
+                key = (min(origin_seed, target_seed), max(origin_seed, target_seed), blend_strength)
+                if key in cache:
+                    img = cache[key]
+                else:
+                    p.seed = origin_seed
+                    p.subseed = target_seed
+                    p.subseed_strength = blend_strength
+                    proc = processing.process_images(p)
+                    img = proc.images[0]
+                    if enable_upscale and upscale_scale != 1.0 and upscale_method != "None":
+                        new_w = int(p.width * upscale_scale)
+                        new_h = int(p.height * upscale_scale)
+                        img = resize_image(0, img, new_w, new_h, upscaler_name=upscale_method)
+                    cache[key] = img
+                gallery.append(img)
+                if state.interrupted:
+                    break
+
+        # Export video
+        if framerate > 0:
+            vid_name = f"travel_mch_{random.randint(0, 99999):05}.mp4"
+            vid_path = os.path.join(output_root, vid_name)
+            writer = imageio.get_writer(vid_path, fps=framerate)
+            for frame in gallery:
+                writer.append_data(np.array(frame))
+            writer.close()
+
+        return processing.Processed(p, gallery if show_preview else [], p.seed)
